@@ -24,9 +24,13 @@ tier (M15 Phase D). Transport mechanism only; scheduler/engine wiring is D2.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import torch
+
+
+def _physical_view_key(tensor: torch.Tensor) -> tuple[int, int]:
+    return tensor.data_ptr(), tensor.nbytes
 
 
 def _physical_view_dedup(
@@ -34,11 +38,11 @@ def _physical_view_dedup(
 ) -> list[torch.Tensor]:
     """Distinct physical views in first-appearance order; None slots (GDN
     state layers carry no KV) are skipped."""
-    seen: dict[int, torch.Tensor] = {}
+    seen: dict[tuple[int, int], torch.Tensor] = {}
     for t in tensors:
         if t is None:
             continue
-        seen.setdefault((t.data_ptr(), t.nbytes), t)
+        seen.setdefault(_physical_view_key(t), t)
     return list(seen.values())
 
 
@@ -47,38 +51,83 @@ def _state_slabs(device_kv_pool) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return list(getattr(device_kv_pool, "state_slabs", None) or ())
 
 
+def _index_k_tensors_by_layer(device_kv_pool) -> list[tuple[int, torch.Tensor]]:
+    """Return optional MSA index-key buffers ordered by logical layer."""
+    buffers = getattr(device_kv_pool, "index_k_buffer", None)
+    indexed_layer_ids = getattr(device_kv_pool, "indexed_layer_ids", None)
+    if not isinstance(buffers, Mapping) or indexed_layer_ids is None:
+        return []
+
+    num_layers = len(device_kv_pool.k_buffer)
+    declared_layer_ids = {int(layer_id) for layer_id in indexed_layer_ids}
+    buffer_layer_ids = {int(layer_id) for layer_id in buffers}
+    if buffer_layer_ids != declared_layer_ids:
+        raise ValueError(
+            "host mirror: index-K buffer layers do not match "
+            f"indexed_layer_ids (buffers={sorted(buffer_layer_ids)}, "
+            f"declared={sorted(declared_layer_ids)})"
+        )
+
+    tensors: list[tuple[int, torch.Tensor]] = []
+    for raw_layer_id, tensor in buffers.items():
+        layer_id = int(raw_layer_id)
+        if not 0 <= layer_id < num_layers:
+            raise ValueError(
+                "host mirror: index-K layer id out of range: "
+                f"{layer_id} not in [0, {num_layers})"
+            )
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                "host mirror: index-K buffer must contain tensors, "
+                f"got {type(tensor).__name__} for layer {layer_id}"
+            )
+        tensors.append((layer_id, tensor))
+    tensors.sort(key=lambda item: item[0])
+    return tensors
+
+
 def bytes_per_host_page(device_kv_pool) -> int:
     """Bytes one host page occupies across all mirrors, computed from the
     device pool alone (no mirror allocation) -- the sizing side of
     ``HostMirror.bytes_per_host_page`` for host-budget arithmetic.
     """
-    tensors = _physical_view_dedup(device_kv_pool.k_buffer) + _physical_view_dedup(
-        device_kv_pool.v_buffer
+    token_tensors = (
+        _physical_view_dedup(device_kv_pool.k_buffer)
+        + _physical_view_dedup(device_kv_pool.v_buffer)
+        + _physical_view_dedup(
+            [tensor for _, tensor in _index_k_tensors_by_layer(device_kv_pool)]
+        )
     )
     page_size = int(device_kv_pool.page_size)
-    kv_bytes = sum(t.element_size() * t[0].numel() * page_size for t in tensors)
+    token_bytes = sum(
+        tensor.element_size() * tensor[0].numel() * page_size
+        for tensor in token_tensors
+    )
     # State slabs are page-indexed: one constant row per page id.
     state_bytes = sum(
         t.element_size() * t[0].numel()
         for pair in _state_slabs(device_kv_pool)
         for t in pair
     )
-    return kv_bytes + state_bytes
+    return token_bytes + state_bytes
 
 
 class HostMirror:
-    """One pinned CPU mirror per DISTINCT device KV tensor plus one per
-    state slab tensor; a (device_page, host_page) pair copies that page's
-    row range on every mirror pair.
+    """Pinned CPU mirrors for device K/V, optional index-K, and state tensors.
+
+    A ``(device_page, host_page)`` pair copies that page's row range on every
+    mirror pair. Mapping-valued MSA ``index_k_buffer`` entries are mirrored;
+    pools without them retain the original K/V/state layout.
 
     Slab tensors are enumerated once each -- a page's rows are exactly its
     owner group's layers, so byte copies are group-safe by id-exclusivity.
 
     ``tensor_pairs`` order (PINNED, D2 fencing indexes into it): K*, V*,
-    then state tensors flattened in slab order (conv0, ssm0, conv1, ...).
-    KV mirrors span ``page_size`` token rows per page; state slabs are
-    page-indexed (one snapshot row per page id), so their mirrors span 1
-    row per page -- ``row_spans[i]`` carries each pair's span.
+    index-K* in ascending layer-id order, then state tensors flattened in slab
+    order (conv0, ssm0, conv1, ...). K/V and index-K mirrors span
+    ``page_size`` token rows per page; state slabs are page-indexed (one
+    snapshot row per page id), so their mirrors span 1 row per page --
+    ``row_spans[i]`` carries each pair's span.
     """
 
     def __init__(self, device_kv_pool, num_host_pages: int):
@@ -92,20 +141,34 @@ class HostMirror:
         v_tensors = _physical_view_dedup(device_kv_pool.v_buffer)
         self.num_k_tensors = len(k_tensors)
 
-        k_index = {(t.data_ptr(), t.nbytes): i for i, t in enumerate(k_tensors)}
-        v_index = {(t.data_ptr(), t.nbytes): i for i, t in enumerate(v_tensors)}
+        k_index = {_physical_view_key(t): i for i, t in enumerate(k_tensors)}
+        v_index = {_physical_view_key(t): i for i, t in enumerate(v_tensors)}
         # None entries (GDN state layers, no KV) map to None: those
         # layers fence on state_tensor_indices_of_layer instead.
         self._layer_to_k_index = [
-            None if t is None else k_index[(t.data_ptr(), t.nbytes)]
+            None if t is None else k_index[_physical_view_key(t)]
             for t in device_kv_pool.k_buffer
         ]
         # Invariant D2 relies on: a layer's V tensor sits at
         # tensor_index_of_layer(layer) + num_k_tensors.
         assert self._layer_to_k_index == [
-            None if t is None else v_index[(t.data_ptr(), t.nbytes)]
+            None if t is None else v_index[_physical_view_key(t)]
             for t in device_kv_pool.v_buffer
         ], "host mirror: K/V dedup orders diverge"
+
+        index_k_by_layer = _index_k_tensors_by_layer(device_kv_pool)
+        index_k_tensors = _physical_view_dedup(
+            [tensor for _, tensor in index_k_by_layer]
+        )
+        self.num_index_k_tensors = len(index_k_tensors)
+        index_k_base = 2 * self.num_k_tensors
+        index_k_index = {
+            _physical_view_key(tensor): i for i, tensor in enumerate(index_k_tensors)
+        }
+        self._layer_to_index_k_index = {
+            layer_id: index_k_base + index_k_index[_physical_view_key(tensor)]
+            for layer_id, tensor in index_k_by_layer
+        }
 
         state_slabs = _state_slabs(device_kv_pool)
         state_tensors = [t for pair in state_slabs for t in pair]
@@ -128,7 +191,7 @@ class HostMirror:
                 ]
 
         pin = torch.cuda.is_available()
-        kv_pairs = [
+        token_pairs = [
             (
                 dev,
                 torch.zeros(
@@ -137,7 +200,7 @@ class HostMirror:
                     pin_memory=pin,
                 ),
             )
-            for dev in k_tensors + v_tensors
+            for dev in k_tensors + v_tensors + index_k_tensors
         ]
         state_pairs = [
             (
@@ -151,11 +214,11 @@ class HostMirror:
             for dev in state_tensors
         ]
         self.tensor_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...] = tuple(
-            kv_pairs + state_pairs
+            token_pairs + state_pairs
         )
-        # Rows one page spans on each pair: page_size token rows for KV,
-        # one page-indexed snapshot row for state slabs.
-        self.row_spans: tuple[int, ...] = (self.page_size,) * len(kv_pairs) + (
+        # Rows one page spans on each pair: page_size token rows for K/V and
+        # index-K, one page-indexed snapshot row for state slabs.
+        self.row_spans: tuple[int, ...] = (self.page_size,) * len(token_pairs) + (
             1,
         ) * len(state_pairs)
 
@@ -169,6 +232,10 @@ class HostMirror:
             raise ValueError(f"layer {layer_id} is a state layer; it has no KV mirror")
         return index
 
+    def index_k_tensor_index_of_layer(self, layer_id: int) -> int | None:
+        """Absolute index of ``layer_id``'s index-K mirror, when present."""
+        return self._layer_to_index_k_index.get(layer_id)
+
     def state_tensor_indices_of_layer(self, layer_id: int) -> tuple[int, int] | None:
         """(conv_idx, ssm_idx) of layer_id's state slab pair in tensor_pairs
         (conv immediately precedes its ssm), or None for layers without
@@ -176,8 +243,18 @@ class HostMirror:
         pair = self._layer_to_state_pair.get(layer_id)
         if pair is None:
             return None
-        base = 2 * self.num_k_tensors + 2 * pair
+        base = 2 * self.num_k_tensors + self.num_index_k_tensors + 2 * pair
         return base, base + 1
+
+    def ready_tensor_index_of_layer(self, layer_id: int) -> int:
+        """Tensor event after which all mirrored data for a layer is readable."""
+        state_indices = self.state_tensor_indices_of_layer(layer_id)
+        if state_indices is not None:
+            return state_indices[1]
+        index_k_index = self.index_k_tensor_index_of_layer(layer_id)
+        if index_k_index is not None:
+            return index_k_index
+        return self.num_k_tensors + self.tensor_index_of_layer(layer_id)
 
     def bytes_per_host_page(self) -> int:
         return sum(

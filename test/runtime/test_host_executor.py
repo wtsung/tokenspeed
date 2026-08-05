@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,6 +41,25 @@ class _StubPool:
         v_slabs = [torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(2)]
         self.k_buffer = [k_slabs[0], k_slabs[0], k_slabs[1], k_slabs[1]]
         self.v_buffer = [v_slabs[0], v_slabs[0], v_slabs[1], v_slabs[1]]
+
+
+class _StubMSAPool(_StubPool):
+    """MiniMax MSA's per-layer K/V plus index-K on layers 0/2."""
+
+    def __init__(self, torch):
+        super().__init__(torch)
+        rows = self.size + self.page_size
+        self.k_buffer = [
+            torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(4)
+        ]
+        self.v_buffer = [
+            torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(4)
+        ]
+        self.indexed_layer_ids = frozenset({0, 2})
+        self.index_k_buffer = {
+            layer_id: torch.zeros((rows, 8), dtype=torch.bfloat16)
+            for layer_id in sorted(self.indexed_layer_ids)
+        }
 
 
 class HostPageSizingTest(unittest.TestCase):
@@ -156,6 +176,68 @@ class LoadBackDonePayloadTest(unittest.TestCase):
         self.assertEqual(self.pop_common([[payload], []]), [])
         both = self.pop_common([[payload], [dict(payload)]])
         self.assertEqual(both, [payload])
+
+
+class MemoryExecutorMSAEventMappingTest(unittest.TestCase):
+    """CPU-only coverage of MSA layer-to-transfer-event fencing."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.cache.executor.memory_executor import (
+                MemoryExecutor,
+            )
+            from tokenspeed.runtime.cache.host_mirror import HostMirror
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + scheduler ext: {exc}")
+        self.torch = torch
+        self.HostMirror = HostMirror
+        self.MemoryExecutor = MemoryExecutor
+
+    def test_sparse_layers_fence_on_index_k_and_finish_covers_last_copy(self):
+        pool = _StubMSAPool(self.torch)
+        with mock.patch(
+            "tokenspeed.runtime.cache.host_mirror.torch.cuda.is_available",
+            return_value=False,
+        ):
+            mirror = self.HostMirror(pool, num_host_pages=2)
+
+        executor = self.MemoryExecutor.__new__(self.MemoryExecutor)
+        executor.layer_num = 4
+        executor.mirror = mirror
+        executor.load_stream = object()
+        executor._pending_load_op_ids = [31]
+        executor._pending_load_pairs = [(1, 0)]
+        executor._immediate_load_op_ids = []
+        executor.ack_load_queue = []
+        executor._producer_map = {}
+        executor._producer_map_limit = 1024
+
+        events = [object() for _ in mirror.tensor_pairs]
+        mirror.load_pages_with_events = mock.Mock(return_value=events)
+        producer_event = mock.Mock()
+        producer_event.start_event = mock.Mock()
+        producer_event.load_events = [None] * executor.layer_num
+        executor._counter = mock.Mock()
+        executor._counter.update_producer.return_value = 0
+        executor._counter.events = [producer_event]
+
+        with mock.patch(
+            "tokenspeed.runtime.cache.executor.memory_executor.get_is_capture_mode",
+            return_value=False,
+        ):
+            executor._start_loading()
+
+        # sparse 0/2 fence on index-K events 8/9; dense 1 fences on V event 5.
+        # The final layer is also the producer-slot/ack fence and covers event 9.
+        self.assertIs(producer_event.load_events[0], events[8])
+        self.assertIs(producer_event.load_events[1], events[5])
+        self.assertIs(producer_event.load_events[2], events[9])
+        self.assertIs(producer_event.load_events[3], events[-1])
+        self.assertIs(executor.ack_load_queue[0].finish_event, events[-1])
+        self.assertEqual(executor.ack_load_queue[0].op_ids, [31])
+        self.assertEqual(executor._producer_map, {31: 0})
 
 
 class MemoryExecutorTest(unittest.TestCase):

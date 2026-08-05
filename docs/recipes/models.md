@@ -69,7 +69,10 @@ ts serve \
 
 MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
 attention layers automatically; select the dense backend with
-`--attention-backend` and run with `--disable-kvstore`.
+`--attention-backend`. For non-speculative serving, KVStore mirrors K/V along
+with the sparse index-K side cache. The EAGLE3 example below keeps
+`--disable-kvstore` because the host tier does not yet mirror a separate
+speculative draft pool.
 
 ```bash
 tokenspeed serve nvidia/MiniMax-M3-NVFP4 \

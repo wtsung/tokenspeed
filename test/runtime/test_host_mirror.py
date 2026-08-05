@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 import unittest
+from contextlib import nullcontext
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -374,6 +377,198 @@ class HostMirrorStateSlabTest(unittest.TestCase):
         kv_only = self.HostMirror(self._pool(with_state=False), num_host_pages=2)
         for layer_id in range(4):
             self.assertIsNone(kv_only.state_tensor_indices_of_layer(layer_id))
+
+
+class HostMirrorMSAIndexKTest(unittest.TestCase):
+    """CPU coverage for MiniMax MSA's sparse index-key side cache."""
+
+    INDEXED_LAYER_IDS = (0, 2)
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.cache.host_mirror import (
+                HostMirror,
+                bytes_per_host_page,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch: {exc}")
+        self.torch = torch
+        self.HostMirror = HostMirror
+        self.bytes_per_host_page = bytes_per_host_page
+
+    def _stub_pool(
+        self,
+        *,
+        with_index_k: bool = True,
+        alias_index_k_views: bool = False,
+        alias_kv: bool = True,
+        with_state: bool = False,
+    ):
+        torch = self.torch
+        page_size = 4
+        size = 8
+        rows = size + page_size
+        kv_tensor_count = 2 if alias_kv else 4
+        k_slabs = [
+            torch.zeros((rows, 1, 8), dtype=torch.bfloat16)
+            for _ in range(kv_tensor_count)
+        ]
+        v_slabs = [
+            torch.zeros((rows, 1, 8), dtype=torch.bfloat16)
+            for _ in range(kv_tensor_count)
+        ]
+        if alias_kv:
+            k_buffer = [k_slabs[0], k_slabs[0], k_slabs[1], k_slabs[1]]
+            v_buffer = [v_slabs[0], v_slabs[0], v_slabs[1], v_slabs[1]]
+        else:
+            k_buffer = k_slabs
+            v_buffer = v_slabs
+        pool = types.SimpleNamespace(
+            page_size=page_size,
+            size=size,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+        )
+        if with_index_k:
+            pool.indexed_layer_ids = frozenset(self.INDEXED_LAYER_IDS)
+            if alias_index_k_views:
+                backing = torch.zeros((rows, 8), dtype=torch.bfloat16)
+                pool.index_k_buffer = {
+                    0: backing.view_as(backing),
+                    2: backing.view_as(backing),
+                }
+            else:
+                pool.index_k_buffer = {
+                    layer_id: torch.zeros((rows, 8), dtype=torch.bfloat16)
+                    for layer_id in sorted(pool.indexed_layer_ids)
+                }
+        if with_state:
+            conv = torch.zeros((4, 2), dtype=torch.bfloat16)
+            ssm = torch.zeros((4, 4), dtype=torch.bfloat16)
+            pool.state_slabs = [(conv, ssm)]
+
+            def get_state_buffers(layer_id):
+                if layer_id == 0:
+                    return conv, ssm
+                raise ValueError(f"layer {layer_id} is not a state layer")
+
+            pool.get_state_buffers = get_state_buffers
+        return pool
+
+    def _mirror(self, pool, num_host_pages: int = 3):
+        with mock.patch(
+            "tokenspeed.runtime.cache.host_mirror.torch.cuda.is_available",
+            return_value=False,
+        ):
+            return self.HostMirror(pool, num_host_pages=num_host_pages)
+
+    def test_capacity_and_sparse_layer_mapping(self):
+        pool = self._stub_pool()
+        # K/V: 4 mirrors * 4 rows * 16 B; index-K: 2 * 4 * 16 B.
+        self.assertEqual(self.bytes_per_host_page(pool), 384)
+
+        mirror = self._mirror(pool)
+        self.assertEqual(mirror.num_k_tensors, 2)
+        self.assertEqual(mirror.num_index_k_tensors, 2)
+        self.assertEqual(len(mirror.tensor_pairs), 6)
+        self.assertEqual(mirror.row_spans, (4,) * 6)
+        self.assertEqual(mirror.bytes_per_host_page(), 384)
+        self.assertIs(mirror.tensor_pairs[4][0], pool.index_k_buffer[0])
+        self.assertIs(mirror.tensor_pairs[5][0], pool.index_k_buffer[2])
+        self.assertEqual(
+            [mirror.ready_tensor_index_of_layer(i) for i in range(4)],
+            [4, 2, 5, 3],
+        )
+
+    def test_per_layer_kv_layout_matches_m3(self):
+        pool = self._stub_pool(alias_kv=False)
+        mirror = self._mirror(pool)
+
+        self.assertEqual(self.bytes_per_host_page(pool), 640)
+        self.assertEqual(mirror.num_k_tensors, 4)
+        self.assertEqual(mirror.num_index_k_tensors, 2)
+        self.assertEqual(len(mirror.tensor_pairs), 10)
+        self.assertEqual(
+            [mirror.ready_tensor_index_of_layer(i) for i in range(4)],
+            [8, 5, 9, 7],
+        )
+
+    def test_index_k_physical_alias_views_are_mirrored_once(self):
+        pool = self._stub_pool(alias_index_k_views=True)
+        self.assertIsNot(pool.index_k_buffer[0], pool.index_k_buffer[2])
+
+        mirror = self._mirror(pool)
+        self.assertEqual(mirror.num_index_k_tensors, 1)
+        self.assertEqual(len(mirror.tensor_pairs), 5)
+        self.assertEqual(mirror.bytes_per_host_page(), 320)
+        self.assertEqual(mirror.index_k_tensor_index_of_layer(0), 4)
+        self.assertEqual(mirror.index_k_tensor_index_of_layer(2), 4)
+
+    def test_state_offsets_include_index_k_and_state_ready_wins(self):
+        mirror = self._mirror(self._stub_pool(with_state=True))
+
+        self.assertEqual(mirror.state_tensor_indices_of_layer(0), (6, 7))
+        self.assertEqual(mirror.index_k_tensor_index_of_layer(0), 4)
+        self.assertEqual(mirror.ready_tensor_index_of_layer(0), 7)
+        self.assertEqual(mirror.ready_tensor_index_of_layer(2), 5)
+
+    def test_store_load_roundtrip_preserves_index_k(self):
+        pool = self._stub_pool(alias_kv=False)
+        mirror = self._mirror(pool)
+        store_pairs = [(1, 2), (2, 0)]
+        source_pages = [device_page for device_page, _ in store_pairs]
+
+        before = []
+        for tensor_idx, ((dev, _), span) in enumerate(
+            zip(mirror.tensor_pairs, mirror.row_spans)
+        ):
+            pages = {}
+            for device_page in source_pages:
+                rows = slice(device_page * span, (device_page + 1) * span)
+                dev[rows].view(self.torch.uint8).fill_(
+                    (tensor_idx * 41 + device_page * 13 + 7) % 256
+                )
+                pages[device_page] = dev[rows].clone()
+            before.append(pages)
+
+        with mock.patch(
+            "tokenspeed.runtime.cache.host_mirror.torch.cuda.stream",
+            side_effect=lambda _stream: nullcontext(),
+        ):
+            mirror.store_pages(store_pairs, stream=None)
+            load_pairs = [(2, 2), (1, 0)]
+            for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans):
+                for device_page, _ in load_pairs:
+                    dev[device_page * span : (device_page + 1) * span].zero_()
+            mirror.load_pages(load_pairs, stream=None)
+
+        source_page_by_host = {
+            host_page: device_page for device_page, host_page in store_pairs
+        }
+        for tensor_idx, ((dev, _), span) in enumerate(
+            zip(mirror.tensor_pairs, mirror.row_spans)
+        ):
+            for destination_page, host_page in load_pairs:
+                actual = dev[destination_page * span : (destination_page + 1) * span]
+                expected = before[tensor_idx][source_page_by_host[host_page]]
+                self.assertTrue(self.torch.equal(actual, expected))
+
+    def test_pool_without_mapping_index_k_keeps_original_layout(self):
+        pool = self._stub_pool(with_index_k=False)
+        mirror = self._mirror(pool)
+        self.assertEqual(self.bytes_per_host_page(pool), 256)
+        self.assertEqual(mirror.num_index_k_tensors, 0)
+        self.assertEqual(len(mirror.tensor_pairs), 4)
+
+        pool.indexed_layer_ids = frozenset(range(4))
+        pool.index_k_buffer = [
+            self.torch.zeros((12, 8), dtype=self.torch.uint8) for _ in range(4)
+        ]
+        mirror = self._mirror(pool)
+        self.assertEqual(self.bytes_per_host_page(pool), 256)
+        self.assertEqual(mirror.num_index_k_tensors, 0)
 
 
 class HostMirrorNoneKVTest(unittest.TestCase):

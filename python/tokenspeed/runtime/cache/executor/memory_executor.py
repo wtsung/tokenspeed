@@ -173,20 +173,9 @@ class MemoryExecutor:
         # the same wait_until(layer_id) machinery.
         self._counter = LayerDoneCounter(self.layer_num)
         device_pool.register_layer_transfer_counter(self._counter)
-        # _start_loading maps layer -> mirror V-tensor event and relies on
-        # load_events[-1] (LayerLoadingEvent.finish_event, reuse fence in
-        # update_producer) covering EVERY copy: it pins the last layer to
-        # the op's last per-tensor event, which without state slabs is the
-        # last layer's V event only if that V mirror is the last KV tensor
-        # pair. Holds for both layouts (legacy: identity; slab: last layer
-        # is the last occurrence of its group). A state last layer has no
-        # KV mirror at all -- its copies (state slabs trail every KV
-        # tensor) are covered by the events[-1] pin in _start_loading.
-        assert (
-            self.mirror.state_tensor_indices_of_layer(self.layer_num - 1) is not None
-            or self.mirror.tensor_index_of_layer(self.layer_num - 1)
-            == self.mirror.num_k_tensors - 1
-        ), "host tier: last layer's V mirror is not the last KV tensor pair"
+        # _start_loading maps each layer to its latest required mirror event
+        # (V, optional index-K, or state SSM), while its final event remains
+        # the producer-slot reuse fence for the whole operation.
 
         write_priority, load_priority = _cache_stream_priorities()
         self.write_stream = _new_cache_stream(write_priority)
@@ -336,28 +325,15 @@ class MemoryExecutor:
         producer_event.start_event.wait(self.load_stream)
 
         events = self.mirror.load_pages_with_events(pairs, self.load_stream)
-        # Layer fence: layer L is readable once its V mirror copy lands; the
-        # load stream is serial (all K copies precede all V copies), so the
-        # V-tensor event also covers L's K copy. Paired slab layers share the
-        # slab event -- correct by design. State layers instead fence on
-        # their ssm event: conv precedes ssm in tensor_pairs order (and both
-        # follow every KV tensor), so on the serial stream the ssm event
-        # covers the conv copy and the layer's KV copies -- the same
-        # K-before-V reasoning as above.
-        num_k = self.mirror.num_k_tensors
+        # Dense layers fence on V, MSA sparse layers fence on index-K, and
+        # state layers fence on SSM. The serial copy stream makes each chosen
+        # event cover all earlier tensors required by that layer.
         for layer_id in range(self.layer_num):
-            state_indices = self.mirror.state_tensor_indices_of_layer(layer_id)
-            if state_indices is not None:
-                producer_event.load_events[layer_id] = events[state_indices[1]]
-            else:
-                producer_event.load_events[layer_id] = events[
-                    num_k + self.mirror.tensor_index_of_layer(layer_id)
-                ]
+            event_index = self.mirror.ready_tensor_index_of_layer(layer_id)
+            producer_event.load_events[layer_id] = events[event_index]
         # finish_event (== load_events[-1]) is the producer-slot reuse fence
-        # in update_producer and must cover EVERY copy of the op; state
-        # tensors copy after all KV tensors, so pin the last layer to the
-        # op's last per-tensor event. A no-op without state slabs: events[-1]
-        # is then the last layer's V event (ctor assert).
+        # and must cover every copy, including optional trailing index-K/state
+        # tensors. Pin the last layer to the operation's final tensor event.
         producer_event.load_events[self.layer_num - 1] = events[-1]
         # events[-1] is also the reassigned finish_event, so the ack covers
         # every copy.
