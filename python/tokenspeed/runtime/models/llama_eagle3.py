@@ -33,6 +33,9 @@ from torch import nn
 from transformers import LlamaConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    is_breakable_capture_active,
+)
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
@@ -95,7 +98,19 @@ class LlamaAttention(BaseLlamaAttention):
         if ctx.draft_narrowing is None:
             return super()._attn(positions, q, k, v, ctx)
 
-        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
+        # Prefill (EXTEND) catch-up: the sliced live rows attend as DECODE, so
+        # query the DECODE capability; never under a breakable prefill-graph
+        # capture, which would bake stale write locations into the graph.
+        # Every other mode queries the backend with the real mode, as before.
+        if ctx.forward_mode.is_extend():
+            prewrite = (
+                not is_breakable_capture_active()
+                and ctx.attn_backend.support_kv_cache_prewrite(ForwardMode.DECODE)
+            )
+        else:
+            prewrite = ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode)
+
+        if prewrite:
             fused_kv_arg = self._build_fused_kv_arg(v, ctx)
             if fused_kv_arg is not None:
                 # The sliced single-token decode attends over the accepted
@@ -107,7 +122,7 @@ class LlamaAttention(BaseLlamaAttention):
                 ).index_select(0, ctx.gather_ids)
                 # record_kv_cache (keyed off the real mode) forces the backend's
                 # PD layerwise cache-step record that the DECODE dispatch would
-                # otherwise skip on an EXTEND/MIXED catch-up.
+                # otherwise skip on an EXTEND catch-up.
                 return ctx.attn_backend.forward(
                     q_rope,
                     None,

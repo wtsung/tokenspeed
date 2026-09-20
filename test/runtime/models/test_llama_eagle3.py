@@ -6,14 +6,21 @@ per-aux-state ``fc_norm`` RMSNorms and the ``norm_output`` aux convention.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from transformers import LlamaConfig
 
+import tokenspeed.runtime.models.llama_eagle3 as llama_eagle3
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
-from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
+from tokenspeed.runtime.models.llama_eagle3 import (
+    LlamaAttention,
+    LlamaForCausalLMEagle3,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _HIDDEN = 32
@@ -125,6 +132,177 @@ def test_eagle3_attention_declares_full_visibility_and_no_storage(
     for layer in paged_layers:
         with pytest.raises(RuntimeError, match="no cache group bound"):
             layer.group_id
+
+
+def test_eagle3_extend_first_step_uses_decode_prewrite_capability() -> None:
+    """MHA can prewrite an extend span, then attend only the last Q as decode."""
+
+    class Backend:
+        def __init__(self) -> None:
+            self.queried_modes = []
+            self.forward_call = None
+
+        def support_kv_cache_prewrite(self, forward_mode):
+            self.queried_modes.append(forward_mode)
+            return forward_mode.is_decode()
+
+        def forward(self, q, k, v, layer, pool, forward_mode, bs, **kwargs):
+            self.forward_call = (q, k, v, layer, pool, forward_mode, bs, kwargs)
+            return q
+
+    class Narrowing:
+        def __init__(self) -> None:
+            self.publish_count = 0
+
+        def publish_accepted_prefix(self) -> None:
+            self.publish_count += 1
+
+    backend = Backend()
+    narrowing = Narrowing()
+    gather_ids = torch.tensor([2, 5], dtype=torch.int64)
+    q = torch.arange(24, dtype=torch.float32).view(6, 4)
+    k = q + 100
+    v = q + 200
+    positions = torch.arange(6)
+    fused_arg = object()
+    seen = {}
+
+    def build_fused_kv_arg(value, ctx):
+        seen["build"] = (value, ctx)
+        return fused_arg
+
+    def fused_rope_kv_write(pos, query, key, arg):
+        seen["prewrite"] = (pos, query, key, arg)
+        return query + 1
+
+    def fallback_rotary(*args, **kwargs):
+        raise AssertionError("full EXTEND attention fallback should not run")
+
+    attention = SimpleNamespace(
+        attn=object(),
+        _build_fused_kv_arg=build_fused_kv_arg,
+        _fused_rope_kv_write=fused_rope_kv_write,
+        rotary_emb=fallback_rotary,
+    )
+    ctx = SimpleNamespace(
+        attn_backend=backend,
+        token_to_kv_pool=object(),
+        bs=2,
+        forward_mode=ForwardMode.EXTEND,
+        gather_ids=gather_ids,
+        draft_narrowing=narrowing,
+    )
+
+    output = LlamaAttention._attn(attention, positions, q, k, v, ctx)
+
+    assert backend.queried_modes == [ForwardMode.DECODE]
+    built_v, built_ctx = seen["build"]
+    assert built_v is v and built_ctx is ctx
+    prewrite_positions, prewrite_q, prewrite_k, prewrite_arg = seen["prewrite"]
+    assert prewrite_positions is positions
+    assert prewrite_q is q and prewrite_k is k
+    assert prewrite_arg is fused_arg
+    assert narrowing.publish_count == 1
+    torch.testing.assert_close(output, (q + 1).index_select(0, gather_ids))
+
+    forwarded = backend.forward_call
+    assert forwarded is not None
+    forwarded_q, forwarded_k, forwarded_v, layer, pool, mode, bs, kwargs = forwarded
+    torch.testing.assert_close(forwarded_q, output)
+    assert forwarded_k is None and forwarded_v is None
+    assert layer is attention.attn
+    assert pool is ctx.token_to_kv_pool
+    assert mode == ForwardMode.DECODE
+    assert bs == ctx.bs
+    assert kwargs == {"save_kv_cache": False, "record_kv_cache": True}
+
+
+@pytest.mark.parametrize(
+    ("forward_mode", "capture_active", "expected_queried_modes"),
+    [
+        (ForwardMode.MIXED, False, [ForwardMode.MIXED]),
+        (ForwardMode.EXTEND, True, []),
+    ],
+)
+def test_eagle3_does_not_force_decode_prewrite_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    forward_mode: ForwardMode,
+    capture_active: bool,
+    expected_queried_modes: list[ForwardMode],
+) -> None:
+    """MIXED and captured EXTEND must not force the DECODE prewrite path.
+
+    MIXED asks the backend with the real MIXED mode (which advertises no
+    prewrite, so the full-attn fallback runs); captured EXTEND short-circuits
+    on the capture check before ever querying the backend.
+    """
+
+    class Backend:
+        def __init__(self) -> None:
+            self.queried_modes = []
+
+        def support_kv_cache_prewrite(self, mode):
+            self.queried_modes.append(mode)
+            return mode.is_decode()
+
+    class Narrowing:
+        def __init__(self) -> None:
+            self.publish_count = 0
+
+        def publish_accepted_prefix(self) -> None:
+            self.publish_count += 1
+
+    class Attention:
+        def __init__(self) -> None:
+            self.call = None
+
+        def __call__(self, q, k, v, *, ctx):
+            self.call = (q, k, v, ctx)
+            return q + 1
+
+    monkeypatch.setattr(
+        llama_eagle3,
+        "is_breakable_capture_active",
+        lambda: capture_active,
+    )
+    backend = Backend()
+    narrowing = Narrowing()
+    paged_attention = Attention()
+    gather_ids = torch.tensor([1, 4], dtype=torch.int64)
+    q = torch.arange(20, dtype=torch.float32).view(5, 4)
+    k = q + 100
+    v = q + 200
+    positions = torch.arange(5)
+
+    def rotary_emb(pos, query, key):
+        assert pos is positions
+        assert query is q and key is k
+        return query + 10, key + 10
+
+    attention = SimpleNamespace(attn=paged_attention, rotary_emb=rotary_emb)
+    ctx = SimpleNamespace(
+        attn_backend=backend,
+        token_to_kv_pool=object(),
+        bs=2,
+        forward_mode=forward_mode,
+        gather_ids=gather_ids,
+        draft_narrowing=narrowing,
+    )
+
+    output = LlamaAttention._attn(attention, positions, q, k, v, ctx)
+
+    # Neither fallback path forces the DECODE capability: MIXED queries with
+    # the real mode and falls back, and captured EXTEND short-circuits on the
+    # capture check before asking.
+    assert backend.queried_modes == expected_queried_modes
+    assert narrowing.publish_count == 0
+    assert paged_attention.call is not None
+    forwarded_q, forwarded_k, forwarded_v, forwarded_ctx = paged_attention.call
+    torch.testing.assert_close(forwarded_q, q + 10)
+    torch.testing.assert_close(forwarded_k, k + 10)
+    assert forwarded_v is v
+    assert forwarded_ctx is ctx
+    torch.testing.assert_close(output, (q + 11).index_select(0, gather_ids))
 
 
 def test_eagle3_fc_norm_and_norm_output_variant(
