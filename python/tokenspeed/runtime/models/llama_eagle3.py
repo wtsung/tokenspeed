@@ -92,6 +92,13 @@ class LlamaAttention(BaseLlamaAttention):
         v: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
+        # TODO(debug): remove before committing.
+        print(
+            f"[eagle3 _attn] mode={ctx.forward_mode} "
+            f"capture={is_breakable_capture_active()} "
+            f"q={tuple(q.shape)} "
+            f"narrowing={'set' if ctx.draft_narrowing is not None else 'None'}"
+        )
         # Active draft first step (the drafter attached the narrowing).
         # Covers both decode catch-up and prefill catch-up; multi-step decode
         # delegates to base.
@@ -109,6 +116,12 @@ class LlamaAttention(BaseLlamaAttention):
             )
         else:
             prewrite = ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode)
+
+        # TODO(debug): remove before committing.
+        print(
+            f"[eagle3 _attn] prewrite={prewrite} "
+            f"gather_ids={None if ctx.gather_ids is None else ctx.gather_ids.tolist()}"
+        )
 
         if prewrite:
             fused_kv_arg = self._build_fused_kv_arg(v, ctx)
